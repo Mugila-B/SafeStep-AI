@@ -2,29 +2,20 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 
-// =====================================================
-// Wi-Fi Configuration
-// =====================================================
+const char* WIFI_SSID = "Joohi";
+const char* WIFI_PASSWORD = "JoohiRm ";   
 
-const char* WIFI_SSID = "Airtel_Balamugi";
-const char* WIFI_PASSWORD = "Balamugi@31";   // use your working password (no trailing space)
 
-// Render backend API
 const char* SERVER_URL =
     "https://safestep-backend-7bwk.onrender.com/api/safestep";
 
-// =====================================================
-// Pin Configuration
-// =====================================================
 
 #define TRIG_PIN 5
 #define ECHO_PIN 18
 #define MOISTURE_PIN 34
 #define VIBRATION_PIN 25
 
-// =====================================================
-// Thresholds
-// =====================================================
+
 
 #define OBSTACLE_DISTANCE 100
 
@@ -32,30 +23,17 @@ const char* SERVER_URL =
 #define MOISTURE_SMOOTH 2200
 #define MOISTURE_SLIPPERY 1500
 
-// =====================================================
-// Timing
-// =====================================================
+
 
 const unsigned long SEND_INTERVAL = 1000;
 const unsigned long SENSOR_INTERVAL = 100;
 
 unsigned long lastSensorTime = 0;
 
-// =====================================================
-// Vibration settings
-// =====================================================
-
-// Obstacle must be "gone" for this many sensor reads (100 ms each)
-// before the obstacle part of the pattern is dropped. Prevents one bad
-// ultrasonic reading from switching patterns. Set to 1 for immediate.
 #define OBSTACLE_CLEAR_READS 2
 
-// 1 = print MOTOR ON / MOTOR OFF on every pulse, 0 = only pattern changes
 #define VIBRATION_DEBUG_PULSES 1
 
-// =====================================================
-// Shared data between tasks
-// =====================================================
 
 #define SURFACE_DRY 0
 #define SURFACE_SMOOTH 1
@@ -66,7 +44,6 @@ volatile bool sharedObstacle = false;
 volatile int sharedSurfaceCode = SURFACE_DRY;
 volatile int activePatternId = 0;
 
-// Snapshot of latest sensor values for the network task
 struct SensorSnapshot
 {
   float distance;
@@ -83,34 +60,27 @@ SensorSnapshot latestData;
 bool snapshotValid = false;
 portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
 
-// =====================================================
-// ===== VIBRATION ENGINE (independent FreeRTOS task) =====
-// =====================================================
 
-// Pattern IDs (shown as "Vibration Pattern ID" in Serial Monitor)
 enum VibPattern
 {
-  VIB_NONE = 0,                  // DRY / SMOOTH (with or without obstacle)
-  VIB_SLIPPERY = 1,
-  VIB_VERY_SLIPPERY = 2,
-  VIB_OBSTACLE_SLIPPERY = 3,
-  VIB_OBSTACLE_VERY_SLIPPERY = 4
+  VIB_NONE = 0,                  
+  VIB_OBSTACLE = 1,              
+  VIB_SLIPPERY = 2,              
+  VIB_VERY_SLIPPERY = 3,         
+  VIB_OBSTACLE_SLIPPERY = 4,     
+  VIB_OBSTACLE_VERY_SLIPPERY = 5 
 };
 
-// Durations in ms: index 0 = ON, 1 = OFF, 2 = ON, 3 = OFF ...
-// Last entry is always an OFF gap, then the pattern repeats.
 
-// Slippery: one long buzz, pause
+const uint16_t PAT_OBSTACLE[] = {200, 800};
+
 const uint16_t PAT_SLIPPERY[] = {1000, 1000};
 
-// Very slippery: very long buzz, short pause
 const uint16_t PAT_VERY_SLIPPERY[] = {1800, 500};
 
-// Obstacle + slippery: short, short, long
-const uint16_t PAT_OBSTACLE_SLIPPERY[] = {200, 150, 200, 150, 1000, 1000};
+const uint16_t PAT_OBSTACLE_SLIPPERY[] = {200, 150, 1000, 1000};
 
-// Obstacle + very slippery: three strong pulses
-const uint16_t PAT_OBSTACLE_VERY_SLIPPERY[] = {600, 150, 600, 150, 600, 1000};
+const uint16_t PAT_OBSTACLE_VERY_SLIPPERY[] = {200, 150, 1800, 500};
 
 bool motorState = false;
 
@@ -128,15 +98,8 @@ void setMotor(bool on)
   }
 }
 
-// Surface decides FIRST. DRY and SMOOTH are always OFF,
-// even if an obstacle is present.
 int selectPattern(bool obstacle, int surfaceCode)
 {
-  if (surfaceCode == SURFACE_DRY || surfaceCode == SURFACE_SMOOTH)
-  {
-    return VIB_NONE;
-  }
-
   if (surfaceCode == SURFACE_VERY_SLIPPERY && obstacle)
   {
     return VIB_OBSTACLE_VERY_SLIPPERY;
@@ -157,6 +120,11 @@ int selectPattern(bool obstacle, int surfaceCode)
     return VIB_SLIPPERY;
   }
 
+  if (obstacle)
+  {
+    return VIB_OBSTACLE;
+  }
+
   return VIB_NONE;
 }
 
@@ -164,6 +132,10 @@ const uint16_t* getPatternSteps(int pattern, int &count)
 {
   switch (pattern)
   {
+    case VIB_OBSTACLE:
+      count = sizeof(PAT_OBSTACLE) / sizeof(PAT_OBSTACLE[0]);
+      return PAT_OBSTACLE;
+
     case VIB_SLIPPERY:
       count = sizeof(PAT_SLIPPERY) / sizeof(PAT_SLIPPERY[0]);
       return PAT_SLIPPERY;
@@ -190,6 +162,9 @@ void printPatternName(int pattern)
 {
   switch (pattern)
   {
+    case VIB_OBSTACLE:
+      Serial.println("VIBRATION: OBSTACLE PATTERN");
+      break;
     case VIB_SLIPPERY:
       Serial.println("VIBRATION: SLIPPERY PATTERN");
       break;
@@ -208,10 +183,10 @@ void printPatternName(int pattern)
   }
 }
 
-// Runs forever on its own. Never waits for Wi-Fi, HTTP or sensors.
+
 void vibrationTask(void* parameter)
 {
-  int currentPattern = -1;        // -1 = nothing started yet
+  int currentPattern = -1;        
   int stepIndex = 0;
   unsigned long stepStart = 0;
 
@@ -224,7 +199,6 @@ void vibrationTask(void* parameter)
 
     if (wanted != currentPattern)
     {
-      // Hazard changed: stop old pattern, restart new one from the beginning
       currentPattern = wanted;
       activePatternId = wanted;
       stepIndex = 0;
@@ -238,12 +212,12 @@ void vibrationTask(void* parameter)
       }
       else
       {
-        setMotor(true);           // step 0 is always ON
+        setMotor(true);           
       }
     }
     else if (wanted == VIB_NONE)
     {
-      setMotor(false);            // SAFE always forces LOW
+      setMotor(false);           
     }
     else
     {
@@ -259,7 +233,6 @@ void vibrationTask(void* parameter)
         stepIndex = (stepIndex + 1) % count;
         stepStart = millis();
 
-        // Even index = ON, odd index = OFF
         setMotor(stepIndex % 2 == 0);
       }
     }
@@ -268,9 +241,6 @@ void vibrationTask(void* parameter)
   }
 }
 
-// =====================================================
-// Wi-Fi Connection
-// =====================================================
 
 void connectWiFi()
 {
@@ -314,9 +284,6 @@ void connectWiFi()
   }
 }
 
-// =====================================================
-// Distance Sensor
-// =====================================================
 
 float readDistance()
 {
@@ -340,18 +307,11 @@ float readDistance()
   return distance;
 }
 
-// =====================================================
-// Moisture Sensor
-// =====================================================
 
 int readMoisture()
 {
   return analogRead(MOISTURE_PIN);
 }
-
-// =====================================================
-// Moisture Percentage
-// =====================================================
 
 int calculateMoisturePercent(int moistureRaw)
 {
@@ -361,10 +321,6 @@ int calculateMoisturePercent(int moistureRaw)
 
   return percent;
 }
-
-// =====================================================
-// Surface Classification
-// =====================================================
 
 String classifySurface(int moistureRaw)
 {
@@ -395,15 +351,11 @@ int surfaceToCode(String surface)
   return SURFACE_DRY;
 }
 
-// =====================================================
-// Risk Score
-// =====================================================
 
 int calculateRiskScore(float distance, String surface)
 {
   int risk = 0;
 
-  // Obstacle risk
   if (distance <= 30)
   {
     risk += 60;
@@ -417,7 +369,6 @@ int calculateRiskScore(float distance, String surface)
     risk += 25;
   }
 
-  // Surface risk
   if (surface == "DRY")
   {
     risk += 0;
@@ -440,9 +391,6 @@ int calculateRiskScore(float distance, String surface)
   return risk;
 }
 
-// =====================================================
-// AI Decision
-// =====================================================
 
 String getAIDecision(int riskScore)
 {
@@ -459,10 +407,6 @@ String getAIDecision(int riskScore)
     return "LOW_RISK";
   }
 }
-
-// =====================================================
-// Hazard Classification
-// =====================================================
 
 String getHazard(bool obstacle, String surface)
 {
@@ -497,10 +441,6 @@ String getHazard(bool obstacle, String surface)
   return "SAFE";
 }
 
-// =====================================================
-// Send Data to Render Backend
-// =====================================================
-
 void sendToServer(
     float distance,
     bool obstacle,
@@ -519,8 +459,6 @@ void sendToServer(
 
   WiFiClientSecure client;
 
-  // For testing/demo.
-  // Production should use proper certificate validation.
   client.setInsecure();
 
   HTTPClient http;
@@ -573,9 +511,6 @@ void sendToServer(
   http.end();
 }
 
-// =====================================================
-// Network task: Wi-Fi + backend (runs separately, may block freely)
-// =====================================================
 
 void networkTask(void* parameter)
 {
@@ -597,7 +532,6 @@ void networkTask(void* parameter)
       }
     }
 
-    // Copy latest sensor values safely
     SensorSnapshot data;
     bool valid = false;
 
@@ -626,10 +560,6 @@ void networkTask(void* parameter)
   }
 }
 
-// =====================================================
-// SETUP
-// =====================================================
-
 void setup()
 {
   Serial.begin(115200);
@@ -644,7 +574,6 @@ void setup()
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  // GPIO 25 -> IN pin of vibration module. HIGH = ON, LOW = OFF.
   pinMode(VIBRATION_PIN, OUTPUT);
   digitalWrite(VIBRATION_PIN, LOW);
 
@@ -652,17 +581,15 @@ void setup()
 
   Serial.println("Sensors initialized.");
 
-  // Vibration task: independent of Wi-Fi and HTTP
   xTaskCreatePinnedToCore(
       vibrationTask,
       "VibrationTask",
       4096,
       NULL,
-      2,          // higher priority than loop() and network task
+      2,          
       NULL,
       1);
 
-  // Network task: Wi-Fi connection + backend upload
   xTaskCreatePinnedToCore(
       networkTask,
       "NetworkTask",
@@ -677,9 +604,6 @@ void setup()
   Serial.println("====================================");
 }
 
-// =====================================================
-// LOOP  (sensors + risk engine only, never waits for network)
-// =====================================================
 
 void loop()
 {
@@ -689,9 +613,6 @@ void loop()
   {
     lastSensorTime = millis();
 
-    // -------------------------------------------------
-    // Read Sensors
-    // -------------------------------------------------
 
     float distance = readDistance();
 
@@ -705,9 +626,6 @@ void loop()
     String surface =
         classifySurface(moistureRaw);
 
-    // -------------------------------------------------
-    // AI Risk Engine
-    // -------------------------------------------------
 
     int riskScore =
         calculateRiskScore(distance, surface);
@@ -717,10 +635,6 @@ void loop()
 
     String hazard =
         getHazard(obstacle, surface);
-
-    // -------------------------------------------------
-    // Give hazard state to the vibration task
-    // -------------------------------------------------
 
     if (obstacle)
     {
@@ -742,9 +656,6 @@ void loop()
 
     sharedSurfaceCode = surfaceToCode(surface);
 
-    // -------------------------------------------------
-    // Save snapshot for the network task
-    // -------------------------------------------------
 
     portENTER_CRITICAL(&dataMux);
 
@@ -767,9 +678,6 @@ void loop()
 
     portEXIT_CRITICAL(&dataMux);
 
-    // -------------------------------------------------
-    // Serial Monitor
-    // -------------------------------------------------
 
     Serial.println();
     Serial.println("------------------------------------");
